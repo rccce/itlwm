@@ -1,4 +1,4 @@
-wcl_fast_power.patch (1st version), against laobamac/itlwm 7204c69 (AirportItlwm 2.4.0, Tahoe/WCL build)
+wcl_fast_power.patch (2nd version), against laobamac/itlwm 7204c69 (AirportItlwm 2.4.0, Tahoe/WCL build)
 
 Why: on Wi-Fi power-on (menu, networksetup, ifconfig) and on wake, airportd
 reaches the network about 10 s late. airportd (macOS 26.7.3, 25G342) starts
@@ -12,11 +12,14 @@ path picks trigger auto_instant_hotspot: 5 s of Instant Hotspot browsing, then
 the retry interval (5 or 10 s), before known networks are scanned.
 
 What:
-1. Quiet power cycle (itlwm_fast & 1): a user power-off (setPOWER 0) and
-   system sleep stop the card without telling WCL; the following firmware
-   start sends no ResetInterface/DriverAvailable. Boot and real failures are
-   reported as before; a firmware start that fails after a quiet stop reports
-   "unavailable".
+1. Quiet Wi-Fi power cycle (itlwm_fast & 1): a user power-off (setPOWER 0)
+   stops the card without telling WCL; the following firmware start sends no
+   ResetInterface/DriverAvailable. Boot and real failures are reported as
+   before; a firmware start that fails after a quiet stop reports
+   "unavailable". System sleep is never quiet: a priority sleep/wake
+   notification marks the sleep, the card then stops and reports exactly as
+   in 7204c69, and a Wi-Fi that was quietly off is reported unavailable at
+   that moment. If the notification cannot be registered, part 1 is off.
 2. Hold requests while the firmware loads (itlwm_fast & 2): a WCL scan or join
    that arrives between power-on (or a MAC-change restart) and firmware ready
    is kept instead of failing with kIOReturnNotReady. iwx_init() starts its
@@ -28,30 +31,44 @@ What:
    BSS now instead of after up to 3.8 s (#40). After the join's own scan,
    scanning covers all channels again.
 
+Changes from the 1st version: the 1st version made system sleep quiet as
+well; on the tester's Mac (AX210, macOS 26.7.3) the Mac then woke again 1-2 s
+after going to sleep. Sleep and wake now behave as in 7204c69 (part 1 above).
+
 Boot-arg itlwm_fast=N selects the parts (default 7); itlwm_fast=0 behaves like
 7204c69. Only the AIRPORT_WCL (Sequoia/Tahoe) builds and the iwx HAL change.
-Not compiled or run by the author of this patch; test from a USB EFI copy and
-keep the previous AirportItlwm.kext.
+The 1st version was built by GitHub Actions and tested for Wi-Fi off/on only;
+this version is not compiled or run by the author of this patch. Test from a
+USB EFI copy and keep the previous AirportItlwm.kext.
 
 diff --git a/AirportItlwm/AirportItlwmSkywalkInterface.hpp b/AirportItlwm/AirportItlwmSkywalkInterface.hpp
-index 2052adf..9ac98e0 100644
+index 2052adf..6667c2c 100644
 --- a/AirportItlwm/AirportItlwmSkywalkInterface.hpp
 +++ b/AirportItlwm/AirportItlwmSkywalkInterface.hpp
-@@ -443,6 +443,8 @@ private:
+@@ -422,6 +422,7 @@ public:
+     void handleWCLEvent(int, void *);
+     void handleWCLLink(bool);
+     void completeWCLScan();
++    void wclSystemWillSleep();
+ private:
+     static IOReturn wclCommand(OSObject *, void *, void *, void *, void *);
+     struct CountryUpdate;
+@@ -443,6 +444,9 @@ private:
      IOReturn leaveWCLNetwork();
      void finishWCLScan(IOReturn);
      void finishWCLJoin(uint16_t, uint16_t, IOReturn);
 +    bool armJoinScan(uint16_t, const uint8_t *, uint32_t);
 +    void disarmJoinScan();
++    void reportQuietDownForSleep();
      void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
      IOTimerEventSource *joinTimer;
      uint8_t joinBSSID[6];
-@@ -466,6 +468,11 @@ private:
+@@ -466,6 +470,11 @@ private:
      bool portAuthorized;
      uint8_t wclPermanentMAC[6] = {};
      bool wclStopping;
-+    // Stopped by a plain power-off or sleep without telling WCL; the next
-+    // firmware start is not reported as a reset either.
++    // Stopped by a plain Wi-Fi power-off without telling WCL; the next
++    // firmware start is not reported as a reset either. System sleep ends it.
 +    bool wclQuietDown = false;
 +    // The scan restriction in ic_wcl_scan_* belongs to the pending join.
 +    bool wclJoinScan = false;
@@ -59,23 +76,60 @@ index 2052adf..9ac98e0 100644
  
  private:
 diff --git a/AirportItlwm/AirportItlwmV2.cpp b/AirportItlwm/AirportItlwmV2.cpp
-index ea1c5ac..89d6009 100644
+index ea1c5ac..0f5babd 100644
 --- a/AirportItlwm/AirportItlwmV2.cpp
 +++ b/AirportItlwm/AirportItlwmV2.cpp
-@@ -334,6 +334,12 @@ bool AirportItlwm::start(IOService *provider)
+@@ -142,6 +142,10 @@ bool AirportItlwm::init(OSDictionary *properties)
+     awdlSyncEnable = true;
+     power_state = 0;
+     memset(geo_location_cc, 0, sizeof(geo_location_cc));
++#ifdef AIRPORT_WCL
++    wclSleepNotifier = NULL;
++    wclSystemSleep = false;
++#endif
+     return ret;
+ }
+ 
+@@ -334,6 +338,13 @@ bool AirportItlwm::start(IOService *provider)
      int he_enabled = 0;
      if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
          fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
-+    // itlwm_fast=N: 1 quiet power-off/sleep, 2 hold scans and joins while the
-+    // firmware loads, 4 fast join. Default 7; itlwm_fast=0 behaves like 7204c69.
++    // itlwm_fast=N: 1 quiet Wi-Fi power-off (not system sleep), 2 hold scans
++    // and joins while the firmware loads, 4 fast join. Default 7;
++    // itlwm_fast=0 behaves like 7204c69.
 +    uint32_t fast = 7;
 +    PE_parse_boot_argn("itlwm_fast", &fast, sizeof(fast));
 +    fHalService->get80211Controller()->ic_wcl_fast = fast & 7;
-+    XYLog("wcl: itlwm_fast=%u\n", fast & 7);
++    XYLog("wcl: itlwm_fast=%u (wcl_fast_power r2)\n", fast & 7);
  #endif
  
      if (!fHalService->attach(pciNub)) {
-@@ -1133,7 +1139,7 @@ setPOWER(OSObject *object,
+@@ -463,6 +474,13 @@ bool AirportItlwm::start(IOService *provider)
+         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
+ #ifdef AIRPORT_WCL
+     bsdInterface->registerService();
++    // A quiet power-off must not last into system sleep (see
++    // wclSleepWakeHandler). Without the notification, never stop quietly.
++    wclSleepNotifier = registerPrioritySleepWakeInterest(&AirportItlwm::wclSleepWakeHandler, this);
++    if (!wclSleepNotifier) {
++        fHalService->get80211Controller()->ic_wcl_fast &= ~1U;
++        XYLog("wcl: no sleep/wake notifications, Wi-Fi power-off reports the driver unavailable\n");
++    }
+ #endif
+     registerService();
+     return true;
+@@ -473,6 +491,10 @@ void AirportItlwm::stop(IOService *provider)
+     XYLog("%s\n", __PRETTY_FUNCTION__);XYLog("%s\n", __PRETTY_FUNCTION__);
+     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
+ #ifdef AIRPORT_WCL
++    if (wclSleepNotifier) {
++        wclSleepNotifier->remove();
++        wclSleepNotifier = NULL;
++    }
+     if (fNetIf)
+         static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->stopWCL();
+ #endif
+@@ -1133,7 +1155,7 @@ setPOWER(OSObject *object,
              changePowerStateToPriv(kPowerStateOff);
              if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) {
                  net80211_ifstats(fHalService->get80211Controller());
@@ -84,25 +138,57 @@ index ea1c5ac..89d6009 100644
              }
          } else {
              changePowerStateToPriv(kPowerStateOn);
-@@ -1370,11 +1376,33 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
+@@ -1370,11 +1392,65 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
      return ret;
  }
  
 +#ifdef AIRPORT_WCL
-+// A user power-off and system sleep only cut power to the card. A real Mac
-+// does not report its driver unavailable for that, and airportd relies on it:
-+// on POWER_CHANGED (power on) it auto-joins with trigger power_on only while
-+// the driver is still "available". If the driver reports unavailable and then
++// A user power-off only cuts power to the card. A real Mac does not report
++// its driver unavailable for that, and airportd relies on it: on
++// POWER_CHANGED (power on) it auto-joins with trigger power_on only while the
++// driver is still "available". If the driver reports unavailable and then
 +// available again, airportd treats power-on as a chip reset and, with the
 +// screen unlocked, starts with an auto_instant_hotspot round instead.
++// System sleep is not quiet. The 1st version of this change made sleep quiet
++// too, and the tester's Mac then woke again 1-2 s after going to sleep; sleep
++// and wake now report the driver unavailable and available as 7204c69 does.
 +void AirportItlwm::quietDisableAdapter()
 +{
 +    auto ic = fHalService->get80211Controller();
-+    ic->ic_wcl_quiet_stop = (ic->ic_wcl_fast & 1) != 0;
++    ic->ic_wcl_quiet_stop = (ic->ic_wcl_fast & 1) != 0 && !wclSystemSleep;
++    if (wclSystemSleep && (ic->ic_ac.ac_if.if_flags & IFF_UP))
++        XYLog("wcl: system sleep, Wi-Fi stops as in 7204c69\n");
 +    disableAdapter(bsdInterface);
 +    // iwx_stop() reports DRIVER_STOPPED synchronously; do not leave the flag
 +    // for a later, unrelated stop if the card was already down.
 +    ic->ic_wcl_quiet_stop = false;
++}
++
++// Priority sleep/wake interest: kIOMessageSystemWillSleep arrives after the
++// applications (airportd) and before any driver's setPowerState, and
++// kIOMessageSystemWillPowerOn before the drivers power on again.
++IOReturn AirportItlwm::wclSleepWakeHandler(void *target, void *, UInt32 messageType,
++                                           IOService *, void *, vm_size_t)
++{
++    AirportItlwm *that = static_cast<AirportItlwm *>(target);
++    if (!that)
++        return kIOReturnSuccess;
++    switch (messageType) {
++        case kIOMessageSystemWillSleep:
++            that->wclSystemSleep = true;
++            // Wi-Fi switched off quietly before: report the driver
++            // unavailable now, as 7204c69 did at the power-off itself.
++            if (that->fNetIf)
++                static_cast<AirportItlwmSkywalkInterface *>(that->fNetIf)->wclSystemWillSleep();
++            break;
++        case kIOMessageSystemWillPowerOn:
++        case kIOMessageSystemHasPoweredOn:
++            that->wclSystemSleep = false;
++            break;
++        default:
++            break;
++    }
++    return kIOReturnSuccess;
 +}
 +#endif
 +
@@ -119,7 +205,7 @@ index ea1c5ac..89d6009 100644
  }
  
 diff --git a/AirportItlwm/AirportItlwmV2.hpp b/AirportItlwm/AirportItlwmV2.hpp
-index 2cc2c69..2d86862 100644
+index 2cc2c69..eb8d73d 100644
 --- a/AirportItlwm/AirportItlwmV2.hpp
 +++ b/AirportItlwm/AirportItlwmV2.hpp
 @@ -120,6 +120,9 @@ public:
@@ -132,8 +218,21 @@ index 2cc2c69..2d86862 100644
      bool initCCLogs();
      
      #ifdef AIRPORT_WCL
+@@ -259,6 +262,12 @@ public:
+     UInt8 pmPCICapPtr;
+     bool magicPacketEnabled;
+     bool magicPacketSupported;
++#ifdef AIRPORT_WCL
++    // Set from kIOMessageSystemWillSleep until the system powers on again.
++    IONotifier *wclSleepNotifier;
++    volatile bool wclSystemSleep;
++    static IOReturn wclSleepWakeHandler(void *, void *, UInt32, IOService *, void *, vm_size_t);
++#endif
+     
+     //AWDL
+     uint8_t *syncFrameTemplate;
 diff --git a/AirportItlwm/WCL/WCL.cpp b/AirportItlwm/WCL/WCL.cpp
-index 0479b34..401ca29 100644
+index 0479b34..905ad2d 100644
 --- a/AirportItlwm/WCL/WCL.cpp
 +++ b/AirportItlwm/WCL/WCL.cpp
 @@ -99,11 +99,13 @@ void AirportItlwmSkywalkInterface::stopWCL()
@@ -150,7 +249,17 @@ index 0479b34..401ca29 100644
          explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
      }
  }
-@@ -240,7 +242,12 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+@@ -179,6 +181,9 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
+         case 12:
+             self->handleWCLEvent(int(uintptr_t(a2)), nullptr);
+             return kIOReturnSuccess;
++        case 16:
++            self->reportQuietDownForSleep();
++            return kIOReturnSuccess;
+         case 11: self->clearWCLPMKSA(); return kIOReturnSuccess;
+         case 8: return self->installWCLKey(static_cast<apple80211_key *>(a2));
+         case 9: return self->accessWCLRSN(static_cast<apple80211_rsn_ie_data *>(a2), true);
+@@ -240,7 +245,12 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
      if (!AirportWCL::decodeScan(request, 0x1550, scan))
          return kIOReturnBadArgument;
      ieee80211com *ic = fHalService->get80211Controller();
@@ -164,7 +273,7 @@ index 0479b34..401ca29 100644
          return kIOReturnNotReady;
      if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
          return kIOReturnBusy;
-@@ -257,7 +264,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+@@ -257,7 +267,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
      }
      scanPending = true;
      scanCompleted = false;
@@ -173,7 +282,7 @@ index 0479b34..401ca29 100644
          ((scan.type != 2 && scan.ssidLength != 0) ||
           ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
      ic->ic_wcl_scan_requested = true;
-@@ -267,6 +274,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+@@ -267,6 +277,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
      ic->ic_wcl_scan_restricted = scan.channelCount != 0;
      memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
      scanSource->setTimeoutMS(20000);
@@ -184,7 +293,7 @@ index 0479b34..401ca29 100644
      if (ic->ic_state == IEEE80211_S_RUN) {
          ieee80211_begin_cache_bgscan(&ic->ic_if);
          if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
-@@ -427,13 +438,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+@@ -427,13 +441,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
      bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
      bool supported = auth != AirportWCL::LegacyAuth::Invalid;
      ieee80211com *ic = fHalService->get80211Controller();
@@ -207,7 +316,7 @@ index 0479b34..401ca29 100644
          explicit_bzero(&join, sizeof(join));
          joinDeferred = joinPending = true;
          joinTimer->setTimeoutMS(30000);
-@@ -525,7 +543,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+@@ -525,7 +546,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
      bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
      disassocIsVoluntary = false;
      joinTimer->setTimeoutMS(30000);
@@ -228,7 +337,7 @@ index 0479b34..401ca29 100644
          joinPending = false;
          joinTimer->cancelTimeout();
          ic->ic_wcl_join_requested = false;
-@@ -534,9 +565,52 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+@@ -534,9 +568,77 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
          explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
          return kIOReturnError;
      }
@@ -278,10 +387,35 @@ index 0479b34..401ca29 100644
 +    ic->ic_wcl_scan_ssid_length = 0;
 +}
 +
++// Called by the priority sleep/wake handler on the power management thread.
++// Take the gate only when Wi-Fi is quietly off (rare); the flag is
++// re-checked under the gate.
++void AirportItlwmSkywalkInterface::wclSystemWillSleep()
++{
++    if (wclQuietDown && _fCommandGate)
++        _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(16));
++}
++
++// System sleep while Wi-Fi is quietly off: report the driver unavailable now,
++// so that sleep and wake see the same state as with 7204c69, where the
++// power-off itself reported it. The next power-on is then a reset again.
++void AirportItlwmSkywalkInterface::reportQuietDownForSleep()
++{
++    if (!wclQuietDown)
++        return;
++    wclQuietDown = false;
++    XYLog("wcl: system sleep while Wi-Fi is off, reporting the driver unavailable\n");
++    AirportWCL::DriverAvailability event = {};
++    event.version = 3;
++    event.available = 0;
++    event.reason = 0xe0821804;
++    instance->postMessage(this, AirportWCL::DriverAvailable, &event, sizeof(event), true);
++}
++
  void AirportItlwmSkywalkInterface::resumeWCLJoin()
  {
      if (!joinDeferred || wclStopping)
-@@ -555,6 +629,7 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
+@@ -555,6 +657,7 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
  
  void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason, IOReturn driverStatus)
  {
@@ -289,7 +423,7 @@ index 0479b34..401ca29 100644
      if (!joinPending)
          return;
      AirportWCL::ConnectionEvent event = {};
-@@ -590,6 +665,7 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
+@@ -590,6 +693,7 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
  IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
  {
      ieee80211com *ic = fHalService->get80211Controller();
@@ -297,25 +431,25 @@ index 0479b34..401ca29 100644
      portAuthorized = false;
      updateWCLLinkQuality(true);
      joinPending = false;
-@@ -662,6 +738,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
+@@ -662,6 +766,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
              if (ic->ic_wcl_mac_reconfig) {
                  break;
              }
-+            // Power returns after a quiet power-off or sleep: WCL never saw
-+            // the driver go away, so this is no interface reset for it.
++            // Power returns after a quiet power-off: WCL never saw the
++            // driver go away, so this is no interface reset for it.
 +            if (wclQuietDown)
 +                break;
              uint32_t reset = 0; // Native resetInterfacesBegin.
              instance->postMessage(this, AirportWCL::ResetInterface, &reset, sizeof(reset), true);
              break;
-@@ -687,6 +767,25 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
+@@ -687,6 +795,25 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                      resumeWCLJoin();
                  break;
              }
 +            if (!ready && ic->ic_wcl_quiet_stop) {
-+                // Plain power-off or sleep: airportd keeps the driver
-+                // "available", so POWER_CHANGED at power-on starts a
-+                // power_on auto-join, as on a real Mac.
++                // Plain Wi-Fi power-off (never system sleep): airportd keeps
++                // the driver "available", so POWER_CHANGED at power-on starts
++                // a power_on auto-join, as on a real Mac.
 +                ic->ic_wcl_quiet_stop = false;
 +                wclQuietDown = true;
 +                XYLog("wcl: quiet power-off, driver stays available for WCL\n");
@@ -334,7 +468,7 @@ index 0479b34..401ca29 100644
              if (ready) {
                  uint32_t reset = 1; // Native resetInterfacesComplete, only after HAL success.
                  instance->postMessage(this, AirportWCL::ResetInterface, &reset, sizeof(reset), true);
-@@ -771,6 +870,14 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
+@@ -771,6 +898,14 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                      scanCompleted = true;
                      scanSource->setTimeoutMS(0);
                  }
