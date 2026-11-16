@@ -1,0 +1,51 @@
+name: wcl-fast build
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'wcl_fast_power.patch'
+      - '.github/workflows/wcl-fast.yml'
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      BASE: 7204c69d1bfa7f5cc0f7864e08fb03e55d0ec29e
+      SDK: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+      SUM: 38cf5aade7e4fa564507833fe2857c2fa56a8d47eb615c3a3443d3637fca2550
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply patch on 7204c69
+        run: |
+          cp wcl_fast_power.patch /tmp/p.patch
+          echo "$SUM  /tmp/p.patch" | shasum -a 256 -c
+          git checkout -f -B wcl-fast "$BASE"
+          git apply /tmp/p.patch
+          git -c user.name=ci -c user.email=ci@localhost commit -q -a -m "wcl_fast_power.patch"
+          git diff --stat "$BASE" HEAD | tail -1
+      - name: MacKernelSDK
+        run: |
+          git clone -q https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+          git -C MacKernelSDK checkout -q "$SDK"
+      - name: Build AirportItlwm-Tahoe
+        run: |
+          xcodebuild -project itlwm.xcodeproj -scheme AirportItlwm-Tahoe -configuration Release ARCHS=x86_64 \
+            SYMROOT="$PWD/build/products" OBJROOT="$PWD/build/obj" CODE_SIGNING_ALLOWED=NO \
+            GIT_COMMIT="_$(git rev-parse --short HEAD)" build > build.log 2>&1 \
+            || { grep -E "error:" build.log | head -50; tail -30 build.log; exit 1; }
+      - name: Package
+        run: |
+          K=$(find build/products -name AirportItlwm.kext -path '*Tahoe*' | head -1)
+          test -n "$K"
+          dwarfdump --uuid "$K/Contents/MacOS/AirportItlwm"
+          ditto -c -k --keepParent "$K" AirportItlwm-wcl-fast.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirportItlwm-wcl-fast
+          path: AirportItlwm-wcl-fast.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log

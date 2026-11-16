@@ -1,0 +1,467 @@
+wcl_fast_power.patch (1st version), against laobamac/itlwm 7204c69 (AirportItlwm 2.4.0, Tahoe/WCL build)
+
+Why: on Wi-Fi power-on (menu, networksetup, ifconfig) and on wake, airportd
+reaches the network about 10 s late. airportd (macOS 26.7.3, 25G342) starts
+an auto-join with trigger power_on when POWER_CHANGED (power on) arrives while
+its node still has isDriverAvailable=1 (airportdProcessDriverEvent). 7204c69
+reports every power-off as "driver unavailable" and every power-on as an
+interface reset plus "driver available", so airportd instead runs its chip-reset
+path (-[CWXPCInterfaceContext processDriverAvailabilityForAutojoin]). With the
+screen unlocked and a recently joined network without 2.4 GHz presence, that
+path picks trigger auto_instant_hotspot: 5 s of Instant Hotspot browsing, then
+the retry interval (5 or 10 s), before known networks are scanned.
+
+What:
+1. Quiet power cycle (itlwm_fast & 1): a user power-off (setPOWER 0) and
+   system sleep stop the card without telling WCL; the following firmware
+   start sends no ResetInterface/DriverAvailable. Boot and real failures are
+   reported as before; a firmware start that fails after a quiet stop reports
+   "unavailable".
+2. Hold requests while the firmware loads (itlwm_fast & 2): a WCL scan or join
+   that arrives between power-on (or a MAC-change restart) and firmware ready
+   is kept instead of failing with kIOReturnNotReady. iwx_init() starts its
+   first scan with the held scan's channels and SSID; a held join resumes at
+   READY.
+3. Fast join (itlwm_fast & 4): a join restricts the next scan to the BSS's
+   channel and SSID, and a full background scan already running is ended
+   through an asynchronous UMAC scan abort, so ieee80211_end_scan() picks the
+   BSS now instead of after up to 3.8 s (#40). After the join's own scan,
+   scanning covers all channels again.
+
+Boot-arg itlwm_fast=N selects the parts (default 7); itlwm_fast=0 behaves like
+7204c69. Only the AIRPORT_WCL (Sequoia/Tahoe) builds and the iwx HAL change.
+Not compiled or run by the author of this patch; test from a USB EFI copy and
+keep the previous AirportItlwm.kext.
+
+diff --git a/AirportItlwm/AirportItlwmSkywalkInterface.hpp b/AirportItlwm/AirportItlwmSkywalkInterface.hpp
+index 2052adf..9ac98e0 100644
+--- a/AirportItlwm/AirportItlwmSkywalkInterface.hpp
++++ b/AirportItlwm/AirportItlwmSkywalkInterface.hpp
+@@ -443,6 +443,8 @@ private:
+     IOReturn leaveWCLNetwork();
+     void finishWCLScan(IOReturn);
+     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
++    bool armJoinScan(uint16_t, const uint8_t *, uint32_t);
++    void disarmJoinScan();
+     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+     IOTimerEventSource *joinTimer;
+     uint8_t joinBSSID[6];
+@@ -466,6 +468,11 @@ private:
+     bool portAuthorized;
+     uint8_t wclPermanentMAC[6] = {};
+     bool wclStopping;
++    // Stopped by a plain power-off or sleep without telling WCL; the next
++    // firmware start is not reported as a reset either.
++    bool wclQuietDown = false;
++    // The scan restriction in ic_wcl_scan_* belongs to the pending join.
++    bool wclJoinScan = false;
+ #endif
+ 
+ private:
+diff --git a/AirportItlwm/AirportItlwmV2.cpp b/AirportItlwm/AirportItlwmV2.cpp
+index ea1c5ac..89d6009 100644
+--- a/AirportItlwm/AirportItlwmV2.cpp
++++ b/AirportItlwm/AirportItlwmV2.cpp
+@@ -334,6 +334,12 @@ bool AirportItlwm::start(IOService *provider)
+     int he_enabled = 0;
+     if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
+         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
++    // itlwm_fast=N: 1 quiet power-off/sleep, 2 hold scans and joins while the
++    // firmware loads, 4 fast join. Default 7; itlwm_fast=0 behaves like 7204c69.
++    uint32_t fast = 7;
++    PE_parse_boot_argn("itlwm_fast", &fast, sizeof(fast));
++    fHalService->get80211Controller()->ic_wcl_fast = fast & 7;
++    XYLog("wcl: itlwm_fast=%u\n", fast & 7);
+ #endif
+ 
+     if (!fHalService->attach(pciNub)) {
+@@ -1133,7 +1139,7 @@ setPOWER(OSObject *object,
+             changePowerStateToPriv(kPowerStateOff);
+             if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) {
+                 net80211_ifstats(fHalService->get80211Controller());
+-                disableAdapter(bsdInterface);
++                quietDisableAdapter();
+             }
+         } else {
+             changePowerStateToPriv(kPowerStateOn);
+@@ -1370,11 +1376,33 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
+     return ret;
+ }
+ 
++#ifdef AIRPORT_WCL
++// A user power-off and system sleep only cut power to the card. A real Mac
++// does not report its driver unavailable for that, and airportd relies on it:
++// on POWER_CHANGED (power on) it auto-joins with trigger power_on only while
++// the driver is still "available". If the driver reports unavailable and then
++// available again, airportd treats power-on as a chip reset and, with the
++// screen unlocked, starts with an auto_instant_hotspot round instead.
++void AirportItlwm::quietDisableAdapter()
++{
++    auto ic = fHalService->get80211Controller();
++    ic->ic_wcl_quiet_stop = (ic->ic_wcl_fast & 1) != 0;
++    disableAdapter(bsdInterface);
++    // iwx_stop() reports DRIVER_STOPPED synchronously; do not leave the flag
++    // for a later, unrelated stop if the card was already down.
++    ic->ic_wcl_quiet_stop = false;
++}
++#endif
++
+ void AirportItlwm::setPowerStateOff()
+ {
+     XYLog("%s\n", __FUNCTION__);
+     pmPowerState = kPowerStateOff;
++#ifdef AIRPORT_WCL
++    quietDisableAdapter();
++#else
+     disableAdapter(bsdInterface);
++#endif
+     pmPolicyMaker->acknowledgeSetPowerState();
+ }
+ 
+diff --git a/AirportItlwm/AirportItlwmV2.hpp b/AirportItlwm/AirportItlwmV2.hpp
+index 2cc2c69..2d86862 100644
+--- a/AirportItlwm/AirportItlwmV2.hpp
++++ b/AirportItlwm/AirportItlwmV2.hpp
+@@ -120,6 +120,9 @@ public:
+     static void eventHandler(struct ieee80211com *, int, void *);
+     IOReturn enableAdapter(IONetworkInterface *netif);
+     void disableAdapter(IONetworkInterface *netif);
++#ifdef AIRPORT_WCL
++    void quietDisableAdapter();
++#endif
+     bool initCCLogs();
+     
+     #ifdef AIRPORT_WCL
+diff --git a/AirportItlwm/WCL/WCL.cpp b/AirportItlwm/WCL/WCL.cpp
+index 0479b34..401ca29 100644
+--- a/AirportItlwm/WCL/WCL.cpp
++++ b/AirportItlwm/WCL/WCL.cpp
+@@ -99,11 +99,13 @@ void AirportItlwmSkywalkInterface::stopWCL()
+         scanSource->cancelTimeout();
+     scanPending = joinPending = false;
+     joinDeferred = false;
++    wclJoinScan = false;
+     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
+     if (fHalService) {
+         ieee80211com *ic = fHalService->get80211Controller();
+         ic->ic_wcl_join_requested = false;
+         ic->ic_wcl_scan_requested = false;
++        ic->ic_wcl_join_scan_skip = 0;
+         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+     }
+ }
+@@ -240,7 +242,12 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+     if (!AirportWCL::decodeScan(request, 0x1550, scan))
+         return kIOReturnBadArgument;
+     ieee80211com *ic = fHalService->get80211Controller();
+-    if (!(ic->ic_if.if_flags & IFF_RUNNING))
++    // Power-on, wake and MAC changes reload the firmware (about 0.3 s). A scan
++    // that arrives meanwhile is kept: iwx_init() starts its first scan with
++    // these parameters, and the end of that scan completes this request.
++    bool loading = (ic->ic_wcl_fast & 2) && (ic->ic_if.if_flags & IFF_UP) &&
++        !(ic->ic_if.if_flags & IFF_RUNNING);
++    if (!(ic->ic_if.if_flags & IFF_RUNNING) && !loading)
+         return kIOReturnNotReady;
+     if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
+         return kIOReturnBusy;
+@@ -257,7 +264,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+     }
+     scanPending = true;
+     scanCompleted = false;
+-    scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
++    scanSkipCompletion = !loading && ic->ic_state == IEEE80211_S_SCAN &&
+         ((scan.type != 2 && scan.ssidLength != 0) ||
+          ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
+     ic->ic_wcl_scan_requested = true;
+@@ -267,6 +274,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
+     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
+     scanSource->setTimeoutMS(20000);
++    if (loading) {
++        XYLog("wcl: scan held until the firmware is ready\n");
++        return kIOReturnSuccess;
++    }
+     if (ic->ic_state == IEEE80211_S_RUN) {
+         ieee80211_begin_cache_bgscan(&ic->ic_if);
+         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
+@@ -427,13 +438,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
+     bool supported = auth != AirportWCL::LegacyAuth::Invalid;
+     ieee80211com *ic = fHalService->get80211Controller();
++    uint16_t joinChannelSpec = join.channelSpec;
++    bool loading = (ic->ic_wcl_fast & 2) && (ic->ic_if.if_flags & IFF_UP) &&
++        !(ic->ic_if.if_flags & IFF_RUNNING);
+     // Applying a private MAC restarts firmware asynchronously. WCL can issue
+     // the association before that restart has completed; keep one request
+     // until the HAL reports READY rather than making the user retry it.
+-    if (supported && !joinPending && ic->ic_wcl_mac_reconfig &&
+-        (ic->ic_if.if_flags & IFF_UP)) {
++    // The same applies while the firmware loads after power-on or wake.
++    if (supported && !joinPending && !scanPending && (ic->ic_if.if_flags & IFF_UP) &&
++        (ic->ic_wcl_mac_reconfig || loading)) {
+         deferredJoin = join;
+         memcpy(joinBSSID, join.bssid, sizeof(joinBSSID));
++        // The first scan after the restart then looks only at this BSS's
++        // channel instead of all 38 (about 3.8 s).
++        armJoinScan(joinChannelSpec, join.ssid, join.ssidLength);
+         explicit_bzero(&join, sizeof(join));
+         joinDeferred = joinPending = true;
+         joinTimer->setTimeoutMS(30000);
+@@ -525,7 +543,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
+     disassocIsVoluntary = false;
+     joinTimer->setTimeoutMS(30000);
++    // Without this, the join waits for the end of whatever full scan net80211
++    // is running (#40). The next scan covers only the BSS's channel, and a
++    // scan already running is ended now; its results usually include the BSS
++    // that WCL just picked from them.
++    bool endScan = false;
++    if (wclJoinScan) {
++        // Armed when this join was deferred; the scan running now is the
++        // restricted one. Setting up the join above cleared the request flag.
++        armJoinScan(joinChannelSpec, ic->ic_des_essid, ic->ic_des_esslen);
++    } else if (armJoinScan(joinChannelSpec, ic->ic_des_essid, ic->ic_des_esslen)) {
++        endScan = ic->ic_state == IEEE80211_S_SCAN;
++    }
+     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
++        disarmJoinScan();
+         joinPending = false;
+         joinTimer->cancelTimeout();
+         ic->ic_wcl_join_requested = false;
+@@ -534,9 +565,52 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+         return kIOReturnError;
+     }
++    if (endScan)
++        fHalService->endScanForJoin();
+     return kIOReturnSuccess;
+ }
+ 
++bool AirportItlwmSkywalkInterface::armJoinScan(uint16_t channelSpec, const uint8_t *ssid, uint32_t ssidLength)
++{
++    ieee80211com *ic = fHalService->get80211Controller();
++    unsigned channel = AirportWCL::primaryChannelFromSpec(channelSpec);
++    // WCL scans cannot be pending while a join is (both return Busy), so the
++    // ic_wcl_scan_* fields are free; check anyway.
++    if (!(ic->ic_wcl_fast & 4) || scanPending || !channel ||
++        channel > IEEE80211_CHAN_MAX || !ic->ic_channels[channel].ic_flags ||
++        ssidLength > sizeof(ic->ic_wcl_scan_ssid))
++        return false;
++    if (!wclJoinScan) {
++        ic->ic_wcl_join_scan_skip = 0;
++        XYLog("wcl: join scan on channel %u (spec 0x%04x)\n", channel, channelSpec);
++    }
++    bzero(ic->ic_wcl_scan_channels, sizeof(ic->ic_wcl_scan_channels));
++    ic->ic_wcl_scan_channels[channel / 8] |= 1U << (channel % 8);
++    ic->ic_wcl_scan_restricted = true;
++    ic->ic_wcl_scan_active = true;
++    bzero(ic->ic_wcl_scan_ssid, sizeof(ic->ic_wcl_scan_ssid));
++    memcpy(ic->ic_wcl_scan_ssid, ssid, ssidLength);
++    ic->ic_wcl_scan_ssid_length = uint8_t(ssidLength);
++    ic->ic_wcl_scan_requested = true;
++    wclJoinScan = true;
++    return true;
++}
++
++void AirportItlwmSkywalkInterface::disarmJoinScan()
++{
++    if (!wclJoinScan)
++        return;
++    wclJoinScan = false;
++    ieee80211com *ic = fHalService->get80211Controller();
++    ic->ic_wcl_join_scan_skip = 0;
++    if (scanPending)
++        return;
++    ic->ic_wcl_scan_requested = false;
++    ic->ic_wcl_scan_restricted = false;
++    ic->ic_wcl_scan_active = false;
++    ic->ic_wcl_scan_ssid_length = 0;
++}
++
+ void AirportItlwmSkywalkInterface::resumeWCLJoin()
+ {
+     if (!joinDeferred || wclStopping)
+@@ -555,6 +629,7 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
+ 
+ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason, IOReturn driverStatus)
+ {
++    disarmJoinScan();
+     if (!joinPending)
+         return;
+     AirportWCL::ConnectionEvent event = {};
+@@ -590,6 +665,7 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
+ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
+ {
+     ieee80211com *ic = fHalService->get80211Controller();
++    disarmJoinScan();
+     portAuthorized = false;
+     updateWCLLinkQuality(true);
+     joinPending = false;
+@@ -662,6 +738,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
+             if (ic->ic_wcl_mac_reconfig) {
+                 break;
+             }
++            // Power returns after a quiet power-off or sleep: WCL never saw
++            // the driver go away, so this is no interface reset for it.
++            if (wclQuietDown)
++                break;
+             uint32_t reset = 0; // Native resetInterfacesBegin.
+             instance->postMessage(this, AirportWCL::ResetInterface, &reset, sizeof(reset), true);
+             break;
+@@ -687,6 +767,25 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
+                     resumeWCLJoin();
+                 break;
+             }
++            if (!ready && ic->ic_wcl_quiet_stop) {
++                // Plain power-off or sleep: airportd keeps the driver
++                // "available", so POWER_CHANGED at power-on starts a
++                // power_on auto-join, as on a real Mac.
++                ic->ic_wcl_quiet_stop = false;
++                wclQuietDown = true;
++                XYLog("wcl: quiet power-off, driver stays available for WCL\n");
++                break;
++            }
++            if (wclQuietDown) {
++                wclQuietDown = false;
++                if (ready) {
++                    XYLog("wcl: quiet power-on, firmware ready\n");
++                    resumeWCLJoin();
++                    break;
++                }
++                // The firmware did not come back: report it from here on.
++                XYLog("wcl: firmware failed after quiet power-off, reporting unavailable\n");
++            }
+             if (ready) {
+                 uint32_t reset = 1; // Native resetInterfacesComplete, only after HAL success.
+                 instance->postMessage(this, AirportWCL::ResetInterface, &reset, sizeof(reset), true);
+@@ -771,6 +870,14 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
+                     scanCompleted = true;
+                     scanSource->setTimeoutMS(0);
+                 }
++            } else if (wclJoinScan) {
++                // The scan that was running when the join came does not count.
++                // After the join's own scan, later scans cover every channel
++                // again, in case the BSS was not on the channel it named.
++                if (ic->ic_wcl_join_scan_skip)
++                    ic->ic_wcl_join_scan_skip--;
++                else
++                    disarmJoinScan();
+             }
+             break;
+         case IEEE80211_EVT_STA_ASSOC_DONE:
+diff --git a/AirportItlwm/WCL/WCL.hpp b/AirportItlwm/WCL/WCL.hpp
+index 04795ab..a8a939d 100644
+--- a/AirportItlwm/WCL/WCL.hpp
++++ b/AirportItlwm/WCL/WCL.hpp
+@@ -34,6 +34,28 @@ inline bool consumeMacReconfiguration(bool &pending, bool ready) {
+     return true;
+ }
+ 
++// Primary 20 MHz channel of a native channel spec, the same encoding this
++// driver uses for scan results: channel (centre channel above 20 MHz) in bits
++// 0-7, control sideband in bits 8-10, bandwidth in bits 11-13 (0x1000 20 MHz,
++// 0x1800 40, 0x2000 80, 0x2800 160) and band in bits 14-15 (0 for 2.4 GHz,
++// 0xc000 for 5 GHz). Returns 0 for anything else, so callers fall back to a
++// full scan.
++inline unsigned primaryChannelFromSpec(uint16_t spec) {
++    int channel = spec & 0xff, sideband = (spec >> 8) & 7, primary;
++    switch (spec & 0x3800) {
++        case 0x1000: primary = sideband ? 0 : channel; break;
++        case 0x1800: primary = sideband > 1 ? 0 : channel + (sideband ? 2 : -2); break;
++        case 0x2000: primary = sideband > 3 ? 0 : channel - 6 + 4 * sideband; break;
++        case 0x2800: primary = channel - 14 + 4 * sideband; break;
++        default: return 0;
++    }
++    if (primary < 1 || primary > 196)
++        return 0;
++    if ((spec & 0xc000) == 0xc000 ? primary <= 14 : ((spec & 0xc000) != 0 || primary > 14))
++        return 0;
++    return unsigned(primary);
++}
++
+ struct HardwareAddress {
+     uint32_t version;
+     uint8_t address[6];
+diff --git a/include/HAL/ItlHalService.hpp b/include/HAL/ItlHalService.hpp
+index 682d7e2..79831d6 100644
+--- a/include/HAL/ItlHalService.hpp
++++ b/include/HAL/ItlHalService.hpp
+@@ -48,6 +48,8 @@ public:
+     virtual struct ieee80211com *get80211Controller() = 0;
+ #ifdef AIRPORT_WCL
+     virtual IOReturn setScanHomeAwayTime(uint32_t) { return kIOReturnUnsupported; }
++    // Ask the firmware to end the foreground scan now. Returns true when a scan was running.
++    virtual bool endScanForJoin() { return false; }
+ #endif
+     
+     virtual ItlDriverInfo *getDriverInfo() = 0;
+diff --git a/itl80211/openbsd/net80211/ieee80211_var.h b/itl80211/openbsd/net80211/ieee80211_var.h
+index dda3058..846903f 100644
+--- a/itl80211/openbsd/net80211/ieee80211_var.h
++++ b/itl80211/openbsd/net80211/ieee80211_var.h
+@@ -440,6 +440,12 @@ struct ieee80211com {
+     void            (*ic_update_chw)(struct ieee80211com *);
+ #ifdef AIRPORT_WCL
+     bool ic_wcl_mac_reconfig;
++    /* Set around a plain power-off or sleep; WCL is not told the driver went away. */
++    bool ic_wcl_quiet_stop;
++    /* Scans to let finish before a join restricts scanning to its channel. */
++    uint8_t ic_wcl_join_scan_skip;
++    /* itlwm_fast boot-arg: 1 quiet power cycle, 2 hold requests while firmware loads, 4 fast join. */
++    uint32_t ic_wcl_fast;
+     bool ic_wcl_enterprise;
+     bool ic_wcl_join_requested;
+     bool ic_wcl_scan_requested;
+diff --git a/itlwm/hal_iwx/ItlIwx.cpp b/itlwm/hal_iwx/ItlIwx.cpp
+index f80e5cb..64a761b 100644
+--- a/itlwm/hal_iwx/ItlIwx.cpp
++++ b/itlwm/hal_iwx/ItlIwx.cpp
+@@ -9051,6 +9051,36 @@ iwx_scan_abort(struct iwx_softc *sc)
+     return err;
+ }
+ 
++#ifdef AIRPORT_WCL
++/*
++ * A join arrived while net80211 runs one of its own full scans (about 3.8 s
++ * on the AX210). Stop that scan now instead of waiting for it. Unlike
++ * iwx_scan_abort(), keep IWX_FLAG_SCANNING: the firmware answers the abort
++ * with SCAN_COMPLETE_UMAC, and iwx_endscan() then runs the normal
++ * ieee80211_end_scan(), which picks the requested BSS from the scan results.
++ * The abort is sent asynchronously so that the WCL join request returns
++ * before any of that happens.
++ */
++bool ItlIwx::
++endScanForJoin()
++{
++    struct iwx_softc *sc = &com;
++    struct ieee80211com *ic = &sc->sc_ic;
++    struct iwx_umac_scan_abort cmd = { 0 };
++    int err;
++
++    if (ic->ic_state != IEEE80211_S_SCAN ||
++        (sc->sc_flags & (IWX_FLAG_SCANNING | IWX_FLAG_BGSCAN)) != IWX_FLAG_SCANNING)
++        return false;
++    /* The end of this scan must not count as the join's own scan. */
++    ic->ic_wcl_join_scan_skip = 1;
++    err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_ABORT_UMAC),
++                           IWX_CMD_ASYNC, sizeof(cmd), &cmd);
++    XYLog("wcl: ending scan early for join, error %d\n", err);
++    return true;
++}
++#endif
++
+ int ItlIwx::
+ iwx_enable_mgmt_queue(struct iwx_softc *sc)
+ {
+diff --git a/itlwm/hal_iwx/ItlIwx.hpp b/itlwm/hal_iwx/ItlIwx.hpp
+index 8360ff1..ec85b42 100644
+--- a/itlwm/hal_iwx/ItlIwx.hpp
++++ b/itlwm/hal_iwx/ItlIwx.hpp
+@@ -158,6 +158,7 @@ public:
+         com.sc_ic.ic_wcl_scan_away_time_ms = milliseconds;
+         return kIOReturnSuccess;
+     }
++    bool endScanForJoin() override;
+ #endif
+     
+     static bool intrFilter(OSObject *object, IOFilterInterruptEventSource *src);
