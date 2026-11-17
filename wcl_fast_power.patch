@@ -1,4 +1,4 @@
-wcl_fast_power.patch (2nd version), against laobamac/itlwm 7204c69 (AirportItlwm 2.4.0, Tahoe/WCL build)
+wcl_fast_power.patch (2nd version, build fix 1), against laobamac/itlwm 7204c69 (AirportItlwm 2.4.0, Tahoe/WCL build)
 
 Why: on Wi-Fi power-on (menu, networksetup, ifconfig) and on wake, airportd
 reaches the network about 10 s late. airportd (macOS 26.7.3, 25G342) starts
@@ -34,6 +34,9 @@ What:
 Changes from the 1st version: the 1st version made system sleep quiet as
 well; on the tester's Mac (AX210, macOS 26.7.3) the Mac then woke again 1-2 s
 after going to sleep. Sleep and wake now behave as in 7204c69 (part 1 above).
+Build fix 1: AirportItlwmV2.cpp includes <IOKit/pwr_mgt/RootDomain.h>, which
+declares registerPrioritySleepWakeInterest (first Actions build of the 2nd
+version failed with "use of undeclared identifier").
 
 Boot-arg itlwm_fast=N selects the parts (default 7); itlwm_fast=0 behaves like
 7204c69. Only the AIRPORT_WCL (Sequoia/Tahoe) builds and the iwx HAL change.
@@ -76,10 +79,18 @@ index 2052adf..6667c2c 100644
  
  private:
 diff --git a/AirportItlwm/AirportItlwmV2.cpp b/AirportItlwm/AirportItlwmV2.cpp
-index ea1c5ac..0f5babd 100644
+index ea1c5ac..699fd42 100644
 --- a/AirportItlwm/AirportItlwmV2.cpp
 +++ b/AirportItlwm/AirportItlwmV2.cpp
-@@ -142,6 +142,10 @@ bool AirportItlwm::init(OSDictionary *properties)
+@@ -6,6 +6,7 @@
+ //  Copyright © 2023 钟先耀. All rights reserved.
+ //
+ 
++#include <IOKit/pwr_mgt/RootDomain.h>
+ #include "AirportItlwmV2.hpp"
+ #include <sys/_netstat.h>
+ #include <crypto/sha1.h>
+@@ -142,6 +143,10 @@ bool AirportItlwm::init(OSDictionary *properties)
      awdlSyncEnable = true;
      power_state = 0;
      memset(geo_location_cc, 0, sizeof(geo_location_cc));
@@ -90,7 +101,7 @@ index ea1c5ac..0f5babd 100644
      return ret;
  }
  
-@@ -334,6 +338,13 @@ bool AirportItlwm::start(IOService *provider)
+@@ -334,6 +339,13 @@ bool AirportItlwm::start(IOService *provider)
      int he_enabled = 0;
      if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
          fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
@@ -104,13 +115,13 @@ index ea1c5ac..0f5babd 100644
  #endif
  
      if (!fHalService->attach(pciNub)) {
-@@ -463,6 +474,13 @@ bool AirportItlwm::start(IOService *provider)
+@@ -463,6 +475,13 @@ bool AirportItlwm::start(IOService *provider)
          fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
  #ifdef AIRPORT_WCL
      bsdInterface->registerService();
 +    // A quiet power-off must not last into system sleep (see
 +    // wclSleepWakeHandler). Without the notification, never stop quietly.
-+    wclSleepNotifier = registerPrioritySleepWakeInterest(&AirportItlwm::wclSleepWakeHandler, this);
++    wclSleepNotifier = registerPrioritySleepWakeInterest(&AirportItlwm::wclSleepWakeHandler, this, NULL);
 +    if (!wclSleepNotifier) {
 +        fHalService->get80211Controller()->ic_wcl_fast &= ~1U;
 +        XYLog("wcl: no sleep/wake notifications, Wi-Fi power-off reports the driver unavailable\n");
@@ -118,7 +129,7 @@ index ea1c5ac..0f5babd 100644
  #endif
      registerService();
      return true;
-@@ -473,6 +491,10 @@ void AirportItlwm::stop(IOService *provider)
+@@ -473,6 +492,10 @@ void AirportItlwm::stop(IOService *provider)
      XYLog("%s\n", __PRETTY_FUNCTION__);XYLog("%s\n", __PRETTY_FUNCTION__);
      struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
  #ifdef AIRPORT_WCL
@@ -129,7 +140,7 @@ index ea1c5ac..0f5babd 100644
      if (fNetIf)
          static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->stopWCL();
  #endif
-@@ -1133,7 +1155,7 @@ setPOWER(OSObject *object,
+@@ -1133,7 +1156,7 @@ setPOWER(OSObject *object,
              changePowerStateToPriv(kPowerStateOff);
              if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) {
                  net80211_ifstats(fHalService->get80211Controller());
@@ -138,7 +149,7 @@ index ea1c5ac..0f5babd 100644
              }
          } else {
              changePowerStateToPriv(kPowerStateOn);
-@@ -1370,11 +1392,65 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
+@@ -1370,11 +1393,65 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
      return ret;
  }
  
